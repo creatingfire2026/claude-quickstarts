@@ -11,6 +11,7 @@
 #   scripts/credentials.sh slack      replace the Slack token (rotation); same for `github`
 #   SLACK_BOT_TOKEN=... GITHUB_TOKEN=... scripts/credentials.sh --from-env [slack|github]
 #                                     no prompts, e.g. GITHUB_TOKEN=$(op read op://...) from a password manager
+#                                     GITHUB_TOKEN_EXPIRES=YYYY-MM-DD records the cron warning date (or none)
 #
 # Exit status: 0 stored (or nothing to do), 3 needs a person at a terminal, anything else is an error.
 set -euo pipefail
@@ -141,11 +142,13 @@ github() {
   say ""; say "== GitHub token (fine-grained, read-only)${token:+ (from \$GITHUB_TOKEN)}"
   cat >&2 <<'EOF'
    1. Open the prefilled token form:
-      https://github.com/settings/personal-access-tokens/new?name=daily-brief&description=Read-only+token+for+the+daily+brief+agent&expires_in=90&contents=read&pull_requests=read
+      https://github.com/settings/personal-access-tokens/new?name=daily-brief&description=Read-only+token+for+the+daily+brief+agent&contents=read&pull_requests=read
       Resource owner: you, or the org that owns the repositories (an org may hold the token
       for admin approval). Repository access: Only select repositories, and pick the ones the
       brief should cover. Leave the permissions as filled in (Contents and Pull requests,
-      read-only), then Generate token.
+      read-only). Expiration: No expiration if the org allows it. A 90-day token stops the
+      weekday cron with nothing watching. If you must set a date, you will type it below so
+      the brief can warn before that date.
    2. Copy the token. It starts with github_pat_.
 EOF
   while :; do
@@ -164,6 +167,38 @@ EOF
         login=$(jq -r .login <<<"${resp%$'\n'*}")
         say "   ✓ GitHub accepts it: token belongs to $login"
         say "     (GitHub does not report a fine-grained token's permissions, so this cannot confirm it is read-only: keep it to what the form filled in)"
+        # /user 200 does not prove the brief can read its repos, or that the MCP server will receive the token.
+        repos_resp=$(bearer "$token" | curl -sS -m 20 -w $'\n%{http_code}' -H @- -H "Accept: application/vnd.github+json" \
+          -H "User-Agent: daily-brief-quickstart" "https://api.github.com/user/repos?per_page=1") || repos_resp=$'\n000'
+        repos_code=${repos_resp##*$'\n'}
+        repos_body=${repos_resp%$'\n'*}
+        if [ "$repos_code" = 200 ] && [ "$(jq 'if type == "array" then length else -1 end' <<<"$repos_body" 2>/dev/null || echo -1)" = 0 ]; then
+          say "   ! Token lists no repositories. Select the repos the brief should cover (Contents and Pull requests, read) or the first run has nothing to read."
+        elif [ "$repos_code" != 200 ]; then
+          say "   ! Could not list repositories (HTTP $repos_code). Repo scope is unconfirmed."
+        fi
+        if [ -f preferences.md ]; then
+          missing=
+          while read -r slug; do
+            [ -n "$slug" ] || continue
+            slug_code=$(bearer "$token" | curl -sS -m 20 -o /dev/null -w '%{http_code}' -H @- \
+              -H "Accept: application/vnd.github+json" -H "User-Agent: daily-brief-quickstart" \
+              "https://api.github.com/repos/$slug") || slug_code=000
+            case "$slug_code" in
+              200) ;;
+              *) missing="$missing $slug($slug_code)" ;;
+            esac
+          done < <(awk 'BEGIN{p=0} /^## /{p=0} /^GitHub repositories/{p=1; next} p' preferences.md | grep -oE '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' || true)
+          if [ -n "$missing" ]; then
+            say "   Token cannot read:${missing}. Grant Contents and Pull requests read on those repositories, then paste again."
+            [ -z "$from_env" ] || { say "   (that was \$GITHUB_TOKEN; fix it, or drop --from-env to type the token)"; exit 1; }
+            token=
+            continue
+          fi
+          say "   ✓ token can read the repositories named in preferences.md"
+        else
+          say "   preferences.md is not written yet, so named repositories were not checked. scripts/run.sh is the MCP inject check; do not unpause on this success alone."
+        fi
         break
       fi
       case "$code" in
@@ -175,10 +210,48 @@ EOF
     [ -z "$from_env" ] || { say "   (that was \$GITHUB_TOKEN; fix it, or drop --from-env to type the token)"; exit 1; }
     token=
   done
-  store github \
+  exp=${GITHUB_TOKEN_EXPIRES:-}
+  if [ -n "$from_env" ] && [ -z "${GITHUB_TOKEN_EXPIRES:-}" ]; then
+    exp=unknown
+    say "   expiry not in \$GITHUB_TOKEN_EXPIRES; recording unknown. The weekday cron cannot warn until you record a date."
+  elif [ -z "$from_env" ]; then
+    IFS= read -r -p "   Expiry date YYYY-MM-DD, or none if it does not expire: " exp || exp=
+    echo >&2
+  fi
+  case "$exp" in
+    none) say "   recorded: no expiration" ;;
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) say "   recorded: rotate before $exp (scripts/credentials.sh github)" ;;
+    *) say "   (not a date; recording unknown)"; exp=unknown ;;
+  esac
+  printf 'github: %s\n' "$exp" > .credential-expiry
+  write_expiry() {
+    local dest=$1 tmp
+    tmp=$(mktemp)
+    if [ -f "$dest" ] && grep -q 'daily-brief:github-expiry' "$dest"; then
+      awk '/<!-- daily-brief:github-expiry -->/{skip=1; next} /<!-- \/daily-brief:github-expiry -->/{skip=0; next} skip{next} {print}' "$dest" > "$tmp"
+      cat "$tmp" > "$dest"
+    fi
+    rm -f "$tmp"
+    cat >> "$dest" <<EOF
+<!-- daily-brief:github-expiry -->
+## Token rotation
+
+- GitHub read token: ${exp}. If this is a date within 14 days, the first line of the brief must say to rotate it with scripts/credentials.sh github before the weekday run stops. If it says none, do not mention it.
+<!-- /daily-brief:github-expiry -->
+EOF
+  }
+  if [ -f preferences.md ]; then
+    write_expiry preferences.md
+    say "   wrote the expiry line into preferences.md. Re-run scripts/seed-preferences.sh so the scheduled brief can warn."
+  else
+    : > github-expiry.md
+    write_expiry github-expiry.md
+    say "   wrote github-expiry.md. Paste that block into preferences.md before scripts/seed-preferences.sh so the scheduled brief can warn."
+  fi
+    store github \
     "$(T=$token jq -nc '{display_name: "GitHub (read-only)", auth: {type: "static_bearer", mcp_server_url: "https://api.githubcopilot.com/mcp/", token: $ENV.T}}')" \
     "$(T=$token jq -nc '{auth: {type: "static_bearer", token: $ENV.T}}')"
-  say "   It expires in 90 days unless you changed that on the form; scripts/credentials.sh github replaces it then."
+  say "   MCP inject is not proven here. scripts/run.sh is the check. Do not unpause until that run is clean."
 }
 
 for c in $want; do "$c"; done

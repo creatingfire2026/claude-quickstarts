@@ -42,13 +42,29 @@ echo "vault: $VAULT_ID attached to the deployment"
 #    prompt, checks each against its service, and adds it to the vault. It needs
 #    a person at a terminal; when this script runs without one (from a coding
 #    agent, say), that step is left for you to run yourself.
+#    An in-flight .env is a migrate path, not a prompt: values are sourced and
+#    passed with --from-env, never printed. Exit 3 means the vault still has no
+#    tokens. This script exits 3 too, so a caller that only checks status does
+#    not unpause.
 rc=0
+cred_args=()
+if [ -f .env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env
+  set +a
+  if [ -n "${SLACK_BOT_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+    echo "credentials: migrating tokens already in .env into the vault (values not printed). Delete .env after this."
+    cred_args=(--from-env)
+  fi
+fi
 trap 'rc=130' INT # a Ctrl-C at the prompt stops that step, not the summary below
-scripts/credentials.sh || rc=$?
+scripts/credentials.sh "${cred_args[@]}" || rc=$?
 trap - INT
+unset SLACK_BOT_TOKEN GITHUB_TOKEN GITHUB_TOKEN_EXPIRES || true
 case $rc in
   0) pending="" ;;
-  3 | 130) pending=1 ;; # no terminal here (3) or interrupted (130): the user does this step next
+  3 | 130) pending=1; echo "credentials: not stored (exit $rc). Do not unpause until scripts/credentials.sh exits 0." >&2 ;;
   *) pending=1; echo "credentials: scripts/credentials.sh failed (exit $rc); see its message above and run it again" >&2 ;;
 esac
 
@@ -61,4 +77,6 @@ Next:${pending:+
   scripts/run.sh                                          start one run now and print what the agent did
   ant beta:deployments unpause --deployment-id $DEPLOYMENT_ID   turn the schedule on once a run looks right
 EOF
-case $rc in 0 | 3 | 130) ;; *) exit "$rc" ;; esac
+# 0 = tokens are in the vault. 3 = needs a terminal. 130 = interrupted. Anything else failed.
+# Do not treat 3 as success: an agent that only checks the exit code must not unpause.
+case $rc in 0) ;; *) exit "$rc" ;; esac

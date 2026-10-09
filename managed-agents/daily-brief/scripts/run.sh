@@ -13,6 +13,21 @@ DEPLOYMENT_ID=$(jq -r '.resources["./agents/daily-brief/deployment.md"].id // em
 STATE_ID=$(jq -r '.resources["./agents/daily-brief/memory_store_state.yaml"].id // empty' claude-lock.json 2>/dev/null || true)
 [ -n "$DEPLOYMENT_ID" ] || { echo "run agents/setup.sh first" >&2; exit 1; }
 
+if [ -f .credential-expiry ]; then
+  exp=$(awk '/^github:/{print $2; exit}' .credential-expiry)
+  case "$exp" in
+    none) ;;
+    ""|unknown) echo "warning: GitHub token expiry was not recorded. An expired token stops the weekday cron. Rotate with scripts/credentials.sh github" >&2 ;;
+    *)
+      secs=$(date -d "$exp" +%s 2>/dev/null || date -j -f %Y-%m-%d "$exp" +%s 2>/dev/null || echo 0)
+      days=$(( (secs - $(date +%s)) / 86400 ))
+      if [ "$days" -le 14 ]; then
+        echo "warning: GitHub token expires $exp ($days days). Rotate with scripts/credentials.sh github before the weekday cron stops." >&2
+      fi
+      ;;
+  esac
+fi
+
 RUN=$(ant beta:deployments run --deployment-id "$DEPLOYMENT_ID" --format json)
 SESSION_ID=$(echo "$RUN" | jq -r '.session_id // empty')
 if [ -z "$SESSION_ID" ]; then

@@ -5,3 +5,5 @@ preferences.md
 # Written by `ant apply`: the IDs of the resources it created in your
 # organization. In your own project, commit it so your team shares them.
 claude-lock.json
+.credential-expiry
+github-expiry.md
